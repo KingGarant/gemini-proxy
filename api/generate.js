@@ -5,10 +5,7 @@ export const config = {
 
 const MODEL = "models/gemini-flash-lite-latest";
 
-// JSON режим оставляем быстрым
 const GEMINI_TIMEOUT_JSON_MS = 9000;
-
-// Для stream можно больше, но клиент (Cloudflare) сам оборвёт на 25с
 const GEMINI_TIMEOUT_STREAM_MS = 70000;
 
 const MAX_OUTPUT_TOKENS = 900;
@@ -63,8 +60,10 @@ export default async function handler(request) {
 
     const stream = new ReadableStream({
       async start(controller) {
-        // Отдаём первый байт сразу — чтобы Vercel не убил функцию за "no initial response within 25s"
+        // Важно: отдаем первый байт сразу, чтобы Vercel не убил функцию за 25s "no initial response"
         controller.enqueue(encoder.encode("\n"));
+
+        let sentAny = false;
 
         const upstreamController = new AbortController();
         const timer = setTimeout(() => upstreamController.abort(), GEMINI_TIMEOUT_STREAM_MS);
@@ -73,7 +72,8 @@ export default async function handler(request) {
         try { request.signal?.addEventListener?.("abort", onClientAbort, { once: true }); } catch {}
 
         try {
-          const url = `https://generativelanguage.googleapis.com/v1beta/${MODEL}:streamGenerateContent?alt=sse&key=${geminiKey}`;
+          const url =
+            `https://generativelanguage.googleapis.com/v1beta/${MODEL}:streamGenerateContent?alt=sse&key=${geminiKey}`;
 
           const r = await fetch(url, {
             method: "POST",
@@ -85,61 +85,81 @@ export default async function handler(request) {
             signal: upstreamController.signal,
           });
 
-          if (!r.ok) {
-            controller.enqueue(encoder.encode("ERROR: upstream_not_ok"));
-            controller.close();
-            return;
-          }
-
-          if (!r.body) {
-            controller.enqueue(encoder.encode("ERROR: no_stream_body"));
+          if (!r.ok || !r.body) {
+            controller.enqueue(encoder.encode("__PROXY_ERROR__ upstream_not_ok"));
             controller.close();
             return;
           }
 
           const reader = r.body.getReader();
           const decoder = new TextDecoder();
-          let buf = "";
+
+          let tail = "";
+          let eventLines = [];
+
+          const flushEvent = () => {
+            if (!eventLines.length) return;
+            for (const line of eventLines) {
+              const l = line.trim();
+              if (!l.startsWith("data:")) continue;
+
+              const dataStr = l.slice(5).trim();
+              if (!dataStr) continue;
+              if (dataStr === "[DONE]") continue;
+
+              try {
+                const obj = JSON.parse(dataStr);
+                const chunk = extractText(obj);
+                if (chunk) {
+                  sentAny = true;
+                  controller.enqueue(encoder.encode(chunk));
+                }
+              } catch {
+                // ignore bad json lines
+              }
+            }
+            eventLines = [];
+          };
 
           while (true) {
             const { value, done } = await reader.read();
             if (done) break;
 
-            buf += decoder.decode(value, { stream: true });
+            const s = decoder.decode(value, { stream: true });
+            const combined = tail + s;
 
-            // SSE события разделены пустой строкой
-            let idx;
-            while ((idx = buf.indexOf("\n\n")) !== -1) {
-              const event = buf.slice(0, idx);
-              buf = buf.slice(idx + 2);
+            // line-by-line parser (works for \n and \r\n)
+            const lines = combined.split("\n");
+            tail = lines.pop() || "";
 
-              for (const line of event.split("\n")) {
-                const l = line.trim();
-                if (!l.startsWith("data:")) continue;
+            for (let line of lines) {
+              if (line.endsWith("\r")) line = line.slice(0, -1);
 
-                const dataStr = l.slice(5).trim();
-                if (!dataStr || dataStr === "[DONE]") continue;
-
-                let obj = null;
-                try { obj = JSON.parse(dataStr); } catch {}
-                if (!obj) continue;
-
-                const chunk = extractText(obj);
-                if (chunk) controller.enqueue(encoder.encode(chunk));
+              if (line === "") {
+                // пустая строка = конец SSE события
+                flushEvent();
+              } else {
+                eventLines.push(line);
               }
             }
           }
 
+          // добиваем последнее событие
+          flushEvent();
+
+          if (!sentAny) {
+            controller.enqueue(encoder.encode("__EMPTY__"));
+          }
+
           controller.close();
         } catch {
-          // сеть/таймаут/abort — просто закрываем поток
+          controller.enqueue(encoder.encode("__PROXY_ERROR__ timeout_or_network"));
           controller.close();
         } finally {
           clearTimeout(timer);
           try { request.signal?.removeEventListener?.("abort", onClientAbort); } catch {}
         }
       },
-      cancel() {},
     });
 
     return new Response(stream, {
@@ -155,7 +175,8 @@ export default async function handler(request) {
   const t = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_JSON_MS);
 
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/${MODEL}:generateContent?key=${geminiKey}`;
+    const url =
+      `https://generativelanguage.googleapis.com/v1beta/${MODEL}:generateContent?key=${geminiKey}`;
 
     const r = await fetch(url, {
       method: "POST",
