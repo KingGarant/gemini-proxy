@@ -5,13 +5,12 @@ export const config = {
 
 const MODEL = "models/gemini-flash-lite-latest";
 
-// Обычный JSON режим
+// JSON режим
 const GEMINI_TIMEOUT_JSON_MS = 9000;
 const MAX_OUTPUT_TOKENS_JSON = 220;
 
-// ВАЖНО: Vercel Edge у тебя таймится, поэтому здесь копим SSE-ответ ограниченно.
-// Подбери 7000..9000, чтобы не ловить FUNCTION_INVOCATION_TIMEOUT.
-const STREAM_COLLECT_MS = 8000;
+// В режиме stream:true мы НЕ стримим наружу, а собираем SSE внутри функции ограниченное время
+const STREAM_COLLECT_MS = 8000;         // можно 7000..9000
 const MAX_OUTPUT_TOKENS_STREAM = 900;
 
 function extractText(data) {
@@ -21,15 +20,16 @@ function extractText(data) {
 }
 
 async function collectFromSSE(r, maxMs) {
-  if (!r.body) return { text: "", done: false };
+  if (!r.body) return { text: "", timedOut: false, ended: true, sawDone: false };
 
   const reader = r.body.getReader();
   const decoder = new TextDecoder();
 
   let text = "";
-  let done = false;
+  let sawDone = false;
+  let ended = false;
+  let timedOut = false;
 
-  // line-based SSE parser (works for \n and \r\n)
   let tail = "";
   let eventLines = [];
 
@@ -43,7 +43,7 @@ async function collectFromSSE(r, maxMs) {
       if (!dataStr) continue;
 
       if (dataStr === "[DONE]") {
-        done = true;
+        sawDone = true;
         continue;
       }
 
@@ -59,9 +59,27 @@ async function collectFromSSE(r, maxMs) {
   };
 
   const start = Date.now();
-  while (Date.now() - start < maxMs) {
-    const { value, done: rdDone } = await reader.read().catch(() => ({ value: null, done: true }));
-    if (rdDone) break;
+
+  while (true) {
+    if (Date.now() - start >= maxMs) {
+      timedOut = true;
+      break;
+    }
+
+    let value, rdDone;
+    try {
+      ({ value, done: rdDone } = await reader.read());
+    } catch {
+      // ошибка чтения = считаем, что поток оборвался
+      ended = true;
+      break;
+    }
+
+    if (rdDone) {
+      ended = true;
+      break;
+    }
+
     if (!value) continue;
 
     const s = decoder.decode(value, { stream: true });
@@ -74,18 +92,24 @@ async function collectFromSSE(r, maxMs) {
       if (line.endsWith("\r")) line = line.slice(0, -1);
 
       if (line === "") {
-        flushEvent(); // end of event
-        if (done) break;
+        flushEvent();
+        if (sawDone) break;
       } else {
         eventLines.push(line);
       }
     }
 
-    if (done) break;
+    if (sawDone) break;
   }
 
   flushEvent();
-  return { text: (text || "").trim(), done };
+
+  // если мы вышли по тайм-ауту — отменим чтение, чтобы не держать ресурсы
+  if (timedOut) {
+    try { await reader.cancel(); } catch {}
+  }
+
+  return { text: (text || "").trim(), timedOut, ended, sawDone };
 }
 
 export default async function handler(request) {
@@ -107,7 +131,7 @@ export default async function handler(request) {
   const wantStream = !!body.stream;
 
   if (!prompt) {
-    return new Response(JSON.stringify({ text: "" }), {
+    return new Response(JSON.stringify({ text: "", partial: false }), {
       headers: { "content-type": "application/json" },
     });
   }
@@ -120,7 +144,7 @@ export default async function handler(request) {
     });
   }
 
-  // ===== режим "stream:true", но наружу отдаём JSON с частичным текстом =====
+  // ===== stream:true (внутри собираем SSE, наружу отдаем JSON) =====
   if (wantStream) {
     const url =
       `https://generativelanguage.googleapis.com/v1beta/${MODEL}:streamGenerateContent?alt=sse&key=${geminiKey}`;
@@ -131,7 +155,7 @@ export default async function handler(request) {
     };
 
     const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), STREAM_COLLECT_MS + 1500);
+    const t = setTimeout(() => controller.abort(), STREAM_COLLECT_MS + 2000);
 
     try {
       const r = await fetch(url, {
@@ -149,13 +173,16 @@ export default async function handler(request) {
         });
       }
 
-      const { text, done } = await collectFromSSE(r, STREAM_COLLECT_MS);
+      const { text, timedOut, ended, sawDone } = await collectFromSSE(r, STREAM_COLLECT_MS);
 
-      // partial=true если не успели дочитать до [DONE]
-      return new Response(JSON.stringify({ text, partial: !done }), {
+      // Считаем "partial" только если мы реально уперлись во время.
+      // Если поток сам закрылся (ended=true) раньше тайма — это полный ответ.
+      const partial = !!text && timedOut && !sawDone && !ended;
+
+      return new Response(JSON.stringify({ text, partial }), {
         headers: { "content-type": "application/json" },
       });
-    } catch (e) {
+    } catch {
       return new Response(JSON.stringify({ status: 504, error: "timeout_or_network" }), {
         status: 500,
         headers: { "content-type": "application/json" },
@@ -165,7 +192,7 @@ export default async function handler(request) {
     }
   }
 
-  // ===== обычный JSON режим (как у тебя работал) =====
+  // ===== stream:false (быстрый JSON как раньше) =====
   const url =
     `https://generativelanguage.googleapis.com/v1beta/${MODEL}:generateContent?key=${geminiKey}`;
 
@@ -198,7 +225,7 @@ export default async function handler(request) {
     return new Response(JSON.stringify({ text, partial: false }), {
       headers: { "content-type": "application/json" },
     });
-  } catch (e) {
+  } catch {
     return new Response(JSON.stringify({ status: 504, error: "timeout_or_network" }), {
       status: 500,
       headers: { "content-type": "application/json" },
