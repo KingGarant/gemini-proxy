@@ -5,10 +5,12 @@ export const config = {
 
 const MODEL = "models/gemini-flash-lite-latest";
 
-// Даем прокси жить дольше минуты, потому что сам бот оборвёт на 60 сек и заберёт partial
-const GEMINI_TIMEOUT_MS = 70_000;
+// Для НЕ-стрима держим коротко, чтобы всегда успеть ответить
+const GEMINI_TIMEOUT_JSON_MS = 9000;
 
-// Можно поднять токены (для длинных ответов). Если ответы стали часто обрезаться — подними ещё.
+// Для СТРИМА можно дольше (но учти: на Vercel Hobby могут быть общие лимиты выполнения)
+const GEMINI_TIMEOUT_STREAM_MS = 70_000;
+
 const MAX_OUTPUT_TOKENS = 900;
 
 function extractText(data) {
@@ -22,7 +24,6 @@ export default async function handler(request) {
 
   const secret = (request.headers.get("x-proxy-secret") || "").trim();
   const expected = (process.env.PROXY_SECRET || "").trim();
-
   if (!expected || secret !== expected) {
     return new Response(JSON.stringify({ status: 403, error: "forbidden" }), {
       status: 403,
@@ -55,107 +56,110 @@ export default async function handler(request) {
     generationConfig: { temperature: 0.6, maxOutputTokens: MAX_OUTPUT_TOKENS },
   };
 
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+  // ================= STREAM MODE =================
+  if (wantStream) {
+    const encoder = new TextEncoder();
 
-  // если клиент (бот) оборвёт соединение — оборвём и запрос к Gemini
-  const onClientAbort = () => controller.abort();
-  try { request.signal?.addEventListener?.("abort", onClientAbort, { once: true }); } catch {}
+    const stream = new ReadableStream({
+      async start(controller) {
+        // Важно: отдаём первый байт сразу, чтобы Vercel не ждал "initial response"
+        controller.enqueue(encoder.encode("\n"));
 
-  try {
-    // ================= STREAM MODE =================
-    if (wantStream) {
-      const url = `https://generativelanguage.googleapis.com/v1beta/${MODEL}:streamGenerateContent?alt=sse&key=${geminiKey}`;
+        const upstreamController = new AbortController();
+        const timer = setTimeout(() => upstreamController.abort(), GEMINI_TIMEOUT_STREAM_MS);
 
-      const r = await fetch(url, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "accept": "text/event-stream",
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
+        // если клиент (Cloudflare бот) оборвёт соединение — оборвём апстрим
+        const onClientAbort = () => upstreamController.abort();
+        try { request.signal?.addEventListener?.("abort", onClientAbort, { once: true }); } catch {}
 
-      if (!r.ok) {
-        const data = await r.json().catch(() => ({}));
-        return new Response(JSON.stringify({ status: r.status, error: data }), {
-          status: 500,
-          headers: { "content-type": "application/json" },
-        });
-      }
+        try {
+          const url = `https://generativelanguage.googleapis.com/v1beta/${MODEL}:streamGenerateContent?alt=sse&key=${geminiKey}`;
 
-      if (!r.body) {
-        // крайне редко, но пусть будет fallback
-        const raw = await r.text();
-        return new Response(raw || "", {
-          headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
-        });
-      }
+          const r = await fetch(url, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "accept": "text/event-stream",
+            },
+            body: JSON.stringify(payload),
+            signal: upstreamController.signal,
+          });
 
-      const encoder = new TextEncoder();
-      const decoder = new TextDecoder();
+          if (!r.ok) {
+            // В стриме уже поздно менять status code, поэтому отдаём текстом
+            controller.enqueue(encoder.encode("Ошибка сервиса (Gemini). Попробуйте позже."));
+            controller.close();
+            return;
+          }
 
-      const stream = new ReadableStream({
-        async start(streamController) {
+          if (!r.body) {
+            controller.enqueue(encoder.encode("Ошибка сервиса (нет потока). Попробуйте позже."));
+            controller.close();
+            return;
+          }
+
           const reader = r.body.getReader();
+          const decoder = new TextDecoder();
+
           let buf = "";
 
-          try {
-            while (true) {
-              const { value, done } = await reader.read();
-              if (done) break;
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
 
-              buf += decoder.decode(value, { stream: true });
+            buf += decoder.decode(value, { stream: true });
 
-              // SSE события разделены пустой строкой
-              let idx;
-              while ((idx = buf.indexOf("\n\n")) !== -1) {
-                const event = buf.slice(0, idx);
-                buf = buf.slice(idx + 2);
+            // SSE события разделены пустой строкой
+            let idx;
+            while ((idx = buf.indexOf("\n\n")) !== -1) {
+              const event = buf.slice(0, idx);
+              buf = buf.slice(idx + 2);
 
-                for (const line of event.split("\n")) {
-                  const l = line.trim();
-                  if (!l.startsWith("data:")) continue;
+              for (const line of event.split("\n")) {
+                const l = line.trim();
+                if (!l.startsWith("data:")) continue;
 
-                  const dataStr = l.slice(5).trim();
-                  if (!dataStr) continue;
+                const dataStr = l.slice(5).trim();
+                if (!dataStr || dataStr === "[DONE]") continue;
 
-                  if (dataStr === "[DONE]") {
-                    streamController.close();
-                    return;
-                  }
+                let obj = null;
+                try { obj = JSON.parse(dataStr); } catch {}
+                if (!obj) continue;
 
-                  let obj = null;
-                  try { obj = JSON.parse(dataStr); } catch { obj = null; }
-                  if (!obj) continue;
-
-                  const chunk = extractText(obj);
-                  if (chunk) streamController.enqueue(encoder.encode(chunk));
-                }
+                const chunk = extractText(obj);
+                if (chunk) controller.enqueue(encoder.encode(chunk));
               }
             }
-
-            streamController.close();
-          } catch {
-            // если оборвали — просто закрываем
-            try { streamController.close(); } catch {}
           }
-        },
-        cancel() {
-          controller.abort();
-        },
-      });
 
-      return new Response(stream, {
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-          "cache-control": "no-store",
-        },
-      });
-    }
+          controller.close();
+        } catch (e) {
+          // таймаут/сеть/abort
+          controller.enqueue(encoder.encode("\nОтвет слишком долгий или сеть нестабильна. Попробуйте ещё раз."));
+          controller.close();
+        } finally {
+          clearTimeout(timer);
+          try { request.signal?.removeEventListener?.("abort", onClientAbort); } catch {}
+        }
+      },
+      cancel() {
+        // ничего критичного — апстрим в любом случае оборвётся по abort/таймеру
+      },
+    });
 
-    // ================= NON-STREAM (как раньше) =================
+    return new Response(stream, {
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+        "cache-control": "no-store",
+      },
+    });
+  }
+
+  // ================= NON-STREAM (как раньше, быстрый JSON) =================
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_JSON_MS);
+
+  try {
     const url = `https://generativelanguage.googleapis.com/v1beta/${MODEL}:generateContent?key=${geminiKey}`;
 
     const r = await fetch(url, {
@@ -178,14 +182,12 @@ export default async function handler(request) {
     return new Response(JSON.stringify({ text }), {
       headers: { "content-type": "application/json" },
     });
-
-  } catch (e) {
+  } catch {
     return new Response(JSON.stringify({ status: 504, error: "timeout_or_network" }), {
       status: 500,
       headers: { "content-type": "application/json" },
     });
   } finally {
     clearTimeout(t);
-    try { request.signal?.removeEventListener?.("abort", onClientAbort); } catch {}
   }
 }
