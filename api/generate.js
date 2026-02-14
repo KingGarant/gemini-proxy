@@ -5,11 +5,11 @@ export const config = {
 
 const MODEL = "models/gemini-flash-lite-latest";
 
-// Для НЕ-стрима держим коротко, чтобы всегда успеть ответить
+// JSON режим оставляем быстрым
 const GEMINI_TIMEOUT_JSON_MS = 9000;
 
-// Для СТРИМА можно дольше (но учти: на Vercel Hobby могут быть общие лимиты выполнения)
-const GEMINI_TIMEOUT_STREAM_MS = 70_000;
+// Для stream можно больше, но клиент (Cloudflare) сам оборвёт на 25с
+const GEMINI_TIMEOUT_STREAM_MS = 70000;
 
 const MAX_OUTPUT_TOKENS = 900;
 
@@ -24,6 +24,7 @@ export default async function handler(request) {
 
   const secret = (request.headers.get("x-proxy-secret") || "").trim();
   const expected = (process.env.PROXY_SECRET || "").trim();
+
   if (!expected || secret !== expected) {
     return new Response(JSON.stringify({ status: 403, error: "forbidden" }), {
       status: 403,
@@ -62,13 +63,12 @@ export default async function handler(request) {
 
     const stream = new ReadableStream({
       async start(controller) {
-        // Важно: отдаём первый байт сразу, чтобы Vercel не ждал "initial response"
+        // Отдаём первый байт сразу — чтобы Vercel не убил функцию за "no initial response within 25s"
         controller.enqueue(encoder.encode("\n"));
 
         const upstreamController = new AbortController();
         const timer = setTimeout(() => upstreamController.abort(), GEMINI_TIMEOUT_STREAM_MS);
 
-        // если клиент (Cloudflare бот) оборвёт соединение — оборвём апстрим
         const onClientAbort = () => upstreamController.abort();
         try { request.signal?.addEventListener?.("abort", onClientAbort, { once: true }); } catch {}
 
@@ -86,21 +86,19 @@ export default async function handler(request) {
           });
 
           if (!r.ok) {
-            // В стриме уже поздно менять status code, поэтому отдаём текстом
-            controller.enqueue(encoder.encode("Ошибка сервиса (Gemini). Попробуйте позже."));
+            controller.enqueue(encoder.encode("ERROR: upstream_not_ok"));
             controller.close();
             return;
           }
 
           if (!r.body) {
-            controller.enqueue(encoder.encode("Ошибка сервиса (нет потока). Попробуйте позже."));
+            controller.enqueue(encoder.encode("ERROR: no_stream_body"));
             controller.close();
             return;
           }
 
           const reader = r.body.getReader();
           const decoder = new TextDecoder();
-
           let buf = "";
 
           while (true) {
@@ -133,18 +131,15 @@ export default async function handler(request) {
           }
 
           controller.close();
-        } catch (e) {
-          // таймаут/сеть/abort
-          controller.enqueue(encoder.encode("\nОтвет слишком долгий или сеть нестабильна. Попробуйте ещё раз."));
+        } catch {
+          // сеть/таймаут/abort — просто закрываем поток
           controller.close();
         } finally {
           clearTimeout(timer);
           try { request.signal?.removeEventListener?.("abort", onClientAbort); } catch {}
         }
       },
-      cancel() {
-        // ничего критичного — апстрим в любом случае оборвётся по abort/таймеру
-      },
+      cancel() {},
     });
 
     return new Response(stream, {
@@ -155,7 +150,7 @@ export default async function handler(request) {
     });
   }
 
-  // ================= NON-STREAM (как раньше, быстрый JSON) =================
+  // ================= NON-STREAM (быстрый JSON) =================
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_JSON_MS);
 
